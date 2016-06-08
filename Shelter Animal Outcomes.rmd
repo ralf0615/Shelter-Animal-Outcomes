@@ -1,0 +1,811 @@
+---
+title: "Shelter Animal Outcomes"
+author: "Yuchen Li"
+date: "May 10, 2016"
+output: html_document
+---
+###Loading data
+```{r}
+require(xgboost)
+train = read.csv("train.csv",header = T, stringsAsFactors = F)
+test = read.csv("test.csv",header = T, stringsAsFactors = F)
+str(train)
+```
+###Cleaning data
+```{r}
+outcome.level = levels(as.factor(train$OutcomeType))
+outcome = as.matrix(as.integer(as.factor(train$OutcomeType)) - 1) #Convert outcomes to number
+##Standardize age upon outcome
+table(train$AgeuponOutcome)
+which(train$AgeuponOutcome == "") ##Ok, there are animals of age zero
+which(train$SexuponOutcome=="")
+train$SexuponOutcome[3175] = "Unknown"
+##Built a function that convert age upon outcome to days
+convert.age = function(df){
+    for(i in (1:dim(df)[1])){
+    if(grepl("year",df$AgeuponOutcome[i])){
+        df$AgeuponOutcome[i] = as.numeric(substr(df$AgeuponOutcome[i],0,which(strsplit(df$AgeuponOutcome[i],"")[[1]]==" "))) * 365
+    }
+    else if(grepl("month",df$AgeuponOutcome[i])){
+        df$AgeuponOutcome[i] = as.numeric(substr(df$AgeuponOutcome[i],0,which(strsplit(df$AgeuponOutcome[i],"")[[1]]==" "))) * 30
+    }
+    else if(grepl("week",df$AgeuponOutcome[i])){
+        df$AgeuponOutcome[i] = as.numeric(substr(df$AgeuponOutcome[i],0,which(strsplit(df$AgeuponOutcome[i],"")[[1]]==" "))) * 7
+    }
+    else if(grepl("day",df$AgeuponOutcome[i])){
+        df$AgeuponOutcome[i] = as.numeric(substr(df$AgeuponOutcome[i],0,which(strsplit(df$AgeuponOutcome[i],"")[[1]]==" "))) * 1
+    }
+    else{
+        df$AgeuponOutcome[i] = 0
+    }
+    }
+    Baby = ifelse(df$AgeuponOutcome<=365,1,0)
+    return(cbind(df,Baby))
+}
+##Create a function that split color into major and minor colors
+convert.color = function(df){
+    temp = data.frame("Major Color" = character(),stringsAsFactors = FALSE)
+    for(i in (1:dim(df)[1])){
+       temp[i,1] = strsplit(strsplit(df$Color[i],"/")[[1]][1]," ")[[1]][1] 
+    }
+    return(cbind(df,temp))
+}
+##Convert Breed
+convert.breed = function(df){
+    df$Breed = tolower(df$Breed)
+    temp = data.frame("Major Breed" = character(),"Mix Breed" = numeric(),stringsAsFactors = FALSE)
+    for(i in (1:dim(df)[1])){
+        
+        temp[i,2] = ifelse(grepl('mix',df$Breed[i]),1,0)
+        if(df$AnimalType[i]=="Cat"){
+            if(grepl("short",df$Breed[i])){
+                temp[i,1] = "Shorthair"
+            }
+            else if(grepl("medium",df$Breed[i])){
+                temp[i,1] = "Mediumhair"            
+            }
+            else if(grepl("long",df$Breed[i])){
+                temp[i,1] = "Longhair"
+            }
+            else
+            {
+                temp[i,1] = "Miscellaneous Cat"
+            }
+        }
+        
+        else{ ##Dog
+            major.breed = gsub(" mix","",strsplit(df$Breed[i],"/")[[1]][1])
+            if(length(which(grepl(strsplit(major.breed," ")[[1]][1],breeds)))!=0){
+                temp[i,1] = groups[which(grepl(strsplit(major.breed," ")[[1]][1],breeds)==TRUE)][1]
+            }
+            else{
+                if(  ( length(which(grepl(strsplit(major.breed," ")[[1]][2],breeds)==TRUE))!=0 ) && (length(strsplit(major.breed," ")[[1]])>=2)){
+                    temp[i,1] = groups[which(grepl(strsplit(major.breed," ")[[1]][2],breeds)==TRUE)][1]
+                }
+                else{
+                    temp[i,1] = "unknown"
+                }
+            }
+        }
+    }
+    return(cbind(df,temp))
+}
+##Convert Sex
+convert.sex = function(df){
+    temp=data.frame("Condition" = character(),"Sex" = character(),stringsAsFactors = FALSE)
+    for(i in (1:dim(df)[1])){
+        if(df$SexuponOutcome[i]=="Unknown"){
+            temp[i,1] = "Unknown"
+            temp[i,2] = "Unknown"
+        }
+        else{
+            temp[i,1] = ifelse(grepl('Intact',df$SexuponOutcome[i]),"Intact","Neutered")
+            temp[i,2] = ifelse(grepl('Male',df$SexuponOutcome[i]),"Male","Female")
+        }
+    }
+    return(cbind(df,temp))
+}
+##Convert time
+require(lubridate)
+convert.time = function(df){
+    temp = data.frame("hour" = numeric(),"mon" = numeric(),"wday" = numeric(),"weekend" = numeric(),"year"=numeric(),stringsAsFactors = F)
+    for(i in (1:dim(df)[1])){
+        temp[i,1] = unclass(as.POSIXlt(df$DateTime[i]))$hour
+        temp[i,2] = unclass(as.POSIXlt(df$DateTime[i]))$mon
+        temp[i,3] = unclass(as.POSIXlt(df$DateTime[i]))$wday
+        temp[i,4] = ifelse((temp[i,3]==0 | temp[i,3]==6),1,0)
+        temp[i,5] = unclass(as.POSIXlt(df$DateTime[i]))$year
+     }
+    return(cbind(df,temp))
+}
+```
+###Run xgboost
+```{r}
+train = read.csv("train.csv",header = T, stringsAsFactors = F)
+train = convert.age(train)
+train.1 = convert.breed(train)
+train.1 = convert.color(train.1)
+train.1 = convert.time(train.1)
+train.1 = convert.sex(train.1)
+train.1$Name = ifelse(train.1$Name=="",0,1) #Convert name to has.name
+##Factorization
+train.1$AnimalType = as.numeric(as.factor(train.1$AnimalType)) - 1
+train.1$Condition = as.numeric(as.factor(train.1$Condition)) - 1
+train.1$Sex = as.numeric(as.factor(train.1$Condition)) - 1
+train.1$Major.Color = as.numeric(as.factor(train.1$Major.Color)) - 1
+train.1$Major.Breed = as.numeric(as.factor(train.1$Major.Breed)) - 1
+train.1$Mix.Breed = as.numeric(as.factor(train.1$Mix.Breed)) - 1
+##Extract a subset of train.1
+colnames(train.1)
+train.xg = as.matrix(subset(train.1,select=c(AnimalType,hour,mon,wday,year,Condition,Sex,Name,AgeuponOutcome,Mix.Breed)))
+mode(train.xg) = "numeric"
+param <- list("objective" = "multi:softprob",    # multiclass classification 
+              "num_class" = 5,    # number of classes 
+              "eval_metric" = "mlogloss",    # evaluation metric 
+              "nthread" = 8,   # number of threads to be used 
+              "max_depth" = 6,    # maximum depth of tree 
+              "eta" = 0.05,    # step size shrinkage 
+              "gamma" = 0,    # minimum loss reduction 
+              "subsample" = 0.85,    # part of data instances to grow tree 
+              "colsample_bytree" = 0.85  # subsample ratio of columns when constructing each tree
+              )
+set.seed(232)
+system.time(train.xg.cv <- xgb.cv(params=param,data=train.xg,label=outcome,nfold=5,nrounds = 400,prediction=TRUE,verbose=F))
+which.min(train.xg.cv$dt[,test.mlogloss.mean])
+min(train.xg.cv$dt[,test.mlogloss.mean])
+train.xg.train = xgboost(params = param,data = train.xg,label = outcome,nrounds = 23,verbose = 0,num_class = 5)
+```
+###Clean test data for xg
+```{r}
+test = convert.age(test)
+test.1 = convert.color(test)
+test.1 = convert.breed(test.1)
+test.1 = convert.sex(test.1)
+test.1 = convert.time(test.1)
+test.1$Name = ifelse(test.1$Name=="",0,1)
+##Factorization
+test.1$AnimalType = as.numeric(as.factor(test.1$AnimalType)) - 1
+test.1$Condition = as.numeric(as.factor(test.1$Condition)) - 1
+test.1$Sex = as.numeric(as.factor(test.1$Sex)) - 1
+test.1$Major.Color = as.numeric(as.factor(test.1$Major.Color)) - 1
+test.1$Major.Breed = as.numeric(as.factor(test.1$Major.Breed)) - 1
+test.1$Mix.Breed = as.numeric(as.factor(test.1$Mix.Breed)) - 1
+test.xg = as.matrix(subset(test.1,select=c(AnimalType,hour,mon,wday,weekend,year,Condition,Sex,AgeuponOutcome,Name,Major.Breed)))
+```
+###Predict using xg
+```{r}
+mode(test.xg) = "numeric"
+pred.xg = predict(train.xg.train,test.xg)
+pred.xg = data.frame(matrix(pred.xg,ncol = 5,byrow = T))
+colnames(pred.xg) = outcome.level
+pred.xg = cbind(test$ID,pred.xg)
+colnames(pred.xg)[1] = "ID"
+write.table(pred.xg,"submission - xgboost - AnimalType - hour - mon - wday - weekend - year - Sex - Condition - AgeuponOutcome - Name - Major.Breed.csv",col.names = TRUE,row.names = FALSE,sep = ",")
+```
+##Breed and group
+```{r}
+breeds = c('Blue Lacy','Queensland Heeler','Rhod Ridgeback','Retriever','Chinese Sharpei','Black Mouth Cur','Catahoula','Staffordshire','Affenpinscher','Afghan Hound','Airedale Terrier','Akita','Australian Kelpie','Alaskan Malamute','English Bulldog','American Bulldog','American English Coonhound','American Eskimo Dog (Miniature)','American Eskimo Dog (Standard)','American Eskimo Dog (Toy)','American Foxhound','American Hairless Terrier','American Staffordshire Terrier','American Water Spaniel','Anatolian Shepherd Dog','Australian Cattle Dog','Australian Shepherd','Australian Terrier','Basenji','Basset Hound','Beagle','Bearded Collie','Beauceron','Bedlington Terrier','Belgian Malinois','Belgian Sheepdog','Belgian Tervuren','Bergamasco','Berger Picard','Bernese Mountain Dog','Bichon Fris_','Black and Tan Coonhound','Black Russian Terrier','Bloodhound','Bluetick Coonhound','Boerboel','Border Collie','Border Terrier','Borzoi','Boston Terrier','Bouvier des Flandres','Boxer','Boykin Spaniel','Briard','Brittany','Brussels Griffon','Bull Terrier','Bull Terrier (Miniature)','Bulldog','Bullmastiff','Cairn Terrier','Canaan Dog','Cane Corso','Cardigan Welsh Corgi','Cavalier King Charles Spaniel','Cesky Terrier','Chesapeake Bay Retriever','Chihuahua','Chinese Crested Dog','Chinese Shar Pei','Chinook','Chow Chow',"Cirneco dell'Etna",'Clumber Spaniel','Cocker Spaniel','Collie','Coton de Tulear','Curly-Coated Retriever','Dachshund','Dalmatian','Dandie Dinmont Terrier','Doberman Pinsch','Doberman Pinscher','Dogue De Bordeaux','English Cocker Spaniel','English Foxhound','English Setter','English Springer Spaniel','English Toy Spaniel','Entlebucher Mountain Dog','Field Spaniel','Finnish Lapphund','Finnish Spitz','Flat-Coated Retriever','French Bulldog','German Pinscher','German Shepherd','German Shorthaired Pointer','German Wirehaired Pointer','Giant Schnauzer','Glen of Imaal Terrier','Golden Retriever','Gordon Setter','Great Dane','Great Pyrenees','Greater Swiss Mountain Dog','Greyhound','Harrier','Havanese','Ibizan Hound','Icelandic Sheepdog','Irish Red and White Setter','Irish Setter','Irish Terrier','Irish Water Spaniel','Irish Wolfhound','Italian Greyhound','Japanese Chin','Keeshond','Kerry Blue Terrier','Komondor','Kuvasz','Labrador Retriever','Lagotto Romagnolo','Lakeland Terrier','Leonberger','Lhasa Apso','L_wchen','Maltese','Manchester Terrier','Mastiff','Miniature American Shepherd','Miniature Bull Terrier','Miniature Pinscher','Miniature Schnauzer','Neapolitan Mastiff','Newfoundland','Norfolk Terrier','Norwegian Buhund','Norwegian Elkhound','Norwegian Lundehund','Norwich Terrier','Nova Scotia Duck Tolling Retriever','Old English Sheepdog','Otterhound','Papillon','Parson Russell Terrier','Pekingese','Pembroke Welsh Corgi','Petit Basset Griffon Vend_en','Pharaoh Hound','Plott','Pointer','Polish Lowland Sheepdog','Pomeranian','Standard Poodle','Miniature Poodle','Toy Poodle','Portuguese Podengo Pequeno','Portuguese Water Dog','Pug','Puli','Pyrenean Shepherd','Rat Terrier','Redbone Coonhound','Rhodesian Ridgeback','Rottweiler','Russell Terrier','St. Bernard','Saluki','Samoyed','Schipperke','Scottish Deerhound','Scottish Terrier','Sealyham Terrier','Shetland Sheepdog','Shiba Inu','Shih Tzu','Siberian Husky','Silky Terrier','Skye Terrier','Sloughi','Smooth Fox Terrier','Soft-Coated Wheaten Terrier','Spanish Water Dog','Spinone Italiano','Staffordshire Bull Terrier','Standard Schnauzer','Sussex Spaniel','Swedish Vallhund','Tibetan Mastiff','Tibetan Spaniel','Tibetan Terrier','Toy Fox Terrier','Treeing Walker Coonhound','Vizsla','Weimaraner','Welsh Springer Spaniel','Welsh Terrier','West Highland White Terrier','Whippet','Wire Fox Terrier','Wirehaired Pointing Griffon','Wirehaired Vizsla','Xoloitzcuintli','Yorkshire Terrier')
+groups = c('Herding','Herding','Hound','Sporting','Non-Sporting','Herding','Herding','Terrier','Toy','Hound','Terrier','Working','Working','Working','Non-Sporting','Non-Sporting','Hound','Non-Sporting','Non-Sporting','Toy','Hound','Terrier','Terrier','Sporting','Working','Herding','Herding','Terrier','Hound','Hound','Hound','Herding','Herding','Terrier','Herding','Herding','Herding','Herding','Herding','Working','Non-Sporting','Hound','Working','Hound','Hound','Working','Herding','Terrier','Hound','Non-Sporting','Herding','Working','Sporting','Herding','Sporting','Toy','Terrier','Terrier','Non-Sporting','Working','Terrier','Working','Working','Herding','Toy','Terrier','Sporting','Toy','Toy','Non-Sporting','Working','Non-Sporting','Hound','Sporting','Sporting','Herding','Non-Sporting','Sporting','Hound','Non-Sporting','Terrier','Working','Working','Working','Sporting','Hound','Sporting','Sporting','Toy','Herding','Sporting','Herding','Non-Sporting','Sporting','Non-Sporting','Working','Herding','Sporting','Sporting','Working','Terrier','Sporting','Sporting','Working','Working','Working','Hound','Hound','Toy','Hound','Herding','Sporting','Sporting','Terrier','Sporting','Hound','Toy','Toy','Non-Sporting','Terrier','Working','Working','Sporting','Sporting','Terrier','Working','Non-Sporting','Non-Sporting','Toy','Terrier','Working','Herding','Terrier','Toy','Terrier','Working','Working','Terrier','Herding','Hound','Non-Sporting','Terrier','Sporting','Herding','Hound','Toy','Terrier','Toy','Herding','Hound','Hound','Hound','Sporting','Herding','Toy','Non-Sporting','Non-Sporting','Toy','Hound','Working','Toy','Herding','Herding','Terrier','Hound','Hound','Working','Terrier','Working','Hound','Working','Non-Sporting','Hound','Terrier','Terrier','Herding','Non-Sporting','Toy','Working','Toy','Terrier','Hound','Terrier','Terrier','Herding','Sporting','Terrier','Working','Sporting','Herding','Working','Non-Sporting','Non-Sporting','Toy','Hound','Sporting','Sporting','Sporting','Terrier','Terrier','Hound','Terrier','Sporting','Sporting','Non-Sporting','Toy')
+breeds = tolower(breeds)
+groups = tolower(groups)
+```
+
+###Random Forest
+```{r}
+library(caret)
+library(randomForest)
+train.rf = subset(train.1,select=c(AnimalType,hour,mon,wday,weekend,year,Condition,Sex,AgeuponOutcome,Name,Mix.Breed))
+train.rf.train = randomForest(as.factor(outcome)~.,data = train.rf,importance = T,na.action = na.omit)
+importance(train.rf.train)
+test.rf = subset(test.1,select=c(AnimalType,hour,mon,wday,weekend,year,Condition,Sex,AgeuponOutcome,Name,Mix.Breed))
+predict.rf = predict(train.rf.train,test.1,type = "prob")
+colnames(predict.rf) = outcome.level
+predict.rf = cbind(test$ID,predict.rf)
+colnames(predict.rf)[1] = "ID"
+write.table(predict.rf,"submission - rf - AnimalType - hour - mon - wday - weekend - year - Condition - Sex - AgeuponOutcome - Name - Mix.Breed.csv",col.names = TRUE,row.names = FALSE,sep = ",")
+```
+
+
+###Averaging XGBoost
+```{r}
+x.1 = read.csv("submission - xgboost - AnimalType - hour - mon - wday - weekend - year - Sex - Condition - AgeuponOutcome - Name - Major.Breed.csv")
+x.2 = read.csv("submission - xgboost - AnimalType - hour - mon - wday - weekend - year - Sex - Condition - AgeuponOutcome - Mix.Breed - Name - Major.Breed - Major.Color.csv")
+x.3 = read.csv("submission - xgboost - AnimalType - hour - mon - wday - weekend - year - SexuponOutcome - AgeuponOutcome - Mix.Breed - Major.Breed - Major.Color - Name.csv") #Second Best
+x.4 = read.csv("submission - xgboost - AnimalType - hour - mon - wday - weekend - year - SexuponOutcome - AgeuponOutcome - Mix.Breed - Name.csv") #Best
+x.bar = data.frame(a=(1:11456),b=numeric(11456),c=numeric(11456),d=numeric(11456),e=numeric(11456),f=numeric(11456))
+for(i in (1:11456)){
+    for(j in (2:6)){
+        x.bar[i,j] = mean(c(x.3[i,j],x.4[i,j]))
+    }
+}
+colnames(x.bar) = append("ID",outcome.level)
+write.table(x.bar,"3.csv",col.names = TRUE,row.names = FALSE,sep = ",")
+```
+
+
+###Internet Reference, https://www.kaggle.com/hamelg/shelter-animal-outcomes/xgboost-w-breed-color-feats/code
+```{r}
+train = read.csv("train.csv",header = T, stringsAsFactors = F)
+test = read.csv("test.csv",header = T, stringsAsFactors = F)
+train$AnimalID <- NULL
+train$OutcomeSubtype <- NULL
+test_ID <- test$ID
+test$ID <- NULL
+
+# Add some date/time-related variables
+library(lubridate)
+
+train$DateTime <- as.POSIXct(train$DateTime)
+test$DateTime <- as.POSIXct(test$DateTime)
+
+train$year <- year(train$DateTime)
+train$month <- month(train$DateTime)
+train$wday <- wday(train$DateTime)
+train$hour <- hour(train$DateTime)
+
+test$year <- year(test$DateTime)
+test$month <- month(test$DateTime)
+test$wday <- wday(test$DateTime)
+test$hour <- hour(test$DateTime)
+
+train$DateTime <- as.numeric(train$DateTime)
+test$DateTime <- as.numeric(test$DateTime)
+
+# Write a function to convert age outcome to numeric age in days
+convert <- function(age_outcome){
+  split <- strsplit(as.character(age_outcome), split=" ")
+  period <- split[[1]][2]
+  if (grepl("year", period)){
+    per_mod <- 365
+  } else if (grepl("month", period)){ 
+    per_mod <- 30
+  } else if (grepl("week", period)){
+    per_mod <- 7
+  } else
+    per_mod <- 1
+  age <- as.numeric(split[[1]][1]) * per_mod
+  return(age)
+}
+
+train$AgeuponOutcome <- sapply(train$AgeuponOutcome, FUN=convert)
+test$AgeuponOutcome <- sapply(test$AgeuponOutcome, FUN=convert)
+sort(table(train$AgeuponOutcome),decreasing = T)[1:3]
+sort(table(test$AgeuponOutcome),decreasing = T)[1:3]
+train[is.na(train)] <- 365  # Fill NA with 365, most common age
+test[is.na(test)] <- 365 # Fill NA with 365, most common age
+
+# Remove row with missing sex label and drop the level
+train <- train[-which(train$SexuponOutcome == ""),]
+train$SexuponOutcome <- droplevels(as.factor(train$SexuponOutcome))
+
+# Add var for name length
+train$name_len <- sapply(as.character(train$Name),nchar)
+test$name_len <- sapply(as.character(test$Name),nchar)
+
+train$Name <- NULL
+test$Name <- NULL
+
+# Create indicator vars for breeds and mix
+train_breeds <- as.character(train$Breed)
+test_breeds <- as.character(test$Breed)
+all_breeds <- unique(c(train_breeds,test_breeds))
+breed_words <- unique(unlist(strsplit(all_breeds, c("/| Mix")))) 
+
+for (breed in breed_words){
+  train[breed] <- as.numeric(grepl(breed, train_breeds))
+  test[breed] <- as.numeric(grepl(breed, test_breeds))
+}
+
+library(stringr)
+
+train["crosses"] <- str_count(train$Breed, pattern="/")
+test["crosses"] <- str_count(test$Breed, pattern="/")
+
+train$Breed <- NULL
+test$Breed <- NULL
+
+# Create indicator vars for color
+train_colors <- as.character(train$Color)
+test_colors <- as.character(test$Color)
+all_colors <- unique(c(train_colors,test_colors))
+color_words <- unique(unlist(strsplit(all_colors, c("/")))) 
+
+for (color in color_words){
+  train[color] <- as.numeric(grepl(color, train_colors))
+  test[color] <- as.numeric(grepl(color, test_colors))
+}
+
+train["color_count"] <- str_count(train$Color, pattern="/")+1
+test["color_count"] <- str_count(test$Color, pattern="/")+1
+
+train$Color <- NULL
+test$Color <- NULL
+
+targets <- train$OutcomeType
+train$OutcomeType <- NULL
+
+
+library(xgboost)
+
+
+# Submission code
+set.seed(121)
+train$AnimalType = as.numeric(as.factor(train$AnimalType))-1
+train$SexuponOutcome = as.numeric(as.factor(train$SexuponOutcome))-1
+test$AnimalType=as.numeric(as.factor(test$AnimalType))-1
+test$SexuponOutcome = as.numeric(as.factor(test$SexuponOutcome))-1
+full_train_matrix <- as.matrix(train)
+test_matrix <- as.matrix(test)
+
+full_targets_train <- as.numeric(as.factor(targets))-1
+
+# Run xgb on full train set
+param <- list("objective" = "multi:softprob",    # multiclass classification 
+              "num_class" = 5,    # number of classes 
+              "eval_metric" = "mlogloss",    # evaluation metric 
+              "nthread" = 8,   # number of threads to be used 
+              "max_depth" = 6,    # maximum depth of tree 
+              "eta" = 0.1,    # step size shrinkage 
+              "subsample" = 0.85,    # part of data instances to grow tree 
+              "colsample_bytree" = 0.85  # subsample ratio of columns when constructing each tree
+              )
+
+min.log = c()
+for(i in (1:100)){
+    set.seed(i)
+    system.time(xgb_model_cv<-xgb.cv(params=param,data=full_train_matrix,label=full_targets_train,nfold=5,nrounds = 400,prediction=TRUE,verbose=F))
+    which.min(xgb_model_cv$dt[,test.mlogloss.mean])
+    print(min(xgb_model_cv$dt[,test.mlogloss.mean]))
+    min.log = append(min.log,min(xgb_model_cv$dt[,test.mlogloss.mean]))
+}
+
+set.seed(9)
+system.time(xgb_model_cv<-xgb.cv(params=param,data=full_train_matrix,label=full_targets_train,nfold=5,nrounds = 400,prediction=TRUE,verbose=F))
+which.min(xgb_model_cv$dt[,test.mlogloss.mean])
+print(min(xgb_model_cv$dt[,test.mlogloss.mean]))
+
+xgb_model_test = xgboost(params = param,data = full_train_matrix,label = full_targets_train,nrounds = 318,verbose = 0,num_class = 5)
+
+test_preds <- predict(xgb_model_test, test_matrix)
+test_preds_frame <- data.frame(matrix(test_preds, ncol = 5, byrow=TRUE))
+
+submission <- cbind(data.frame(ID=test_ID), test_preds_frame)
+colnames(submission)[2:6] <- outcome.level
+
+write.csv(submission , "4.csv", row.names=FALSE)
+```
+
+###Averaging XGBoost 
+```{r}
+x.1 = read.csv("8.csv")
+x.2 = read.csv("8.csv")
+x.3 = read.csv("14.csv")
+x.4 = read.csv("15.csv")
+
+for(i in (1:11456)){
+    for(j in (2:6)){
+        x.bar[i,j] = mean(c(x.1[i,j],x.2[i,j],x.3[i,j],x.4[i,j]))
+    }
+}
+colnames(x.bar) = append("ID",outcome.level)
+write.table(x.bar,"24.csv",col.names = TRUE,row.names = FALSE,sep = ",")
+```
+
+
+###Stacking XGBoost
+```{r}
+
+# Run xgb on full train set
+param <- list("objective" = "multi:softprob",    # multiclass classification 
+              "num_class" = 5,    # number of classes 
+              "eval_metric" = "mlogloss",    # evaluation metric 
+              "nthread" = 8,   # number of threads to be used 
+              "max_depth" = 10,    # maximum depth of tree 
+              "eta" = 0.1,    # step size shrinkage 
+              "subsample" = 0.85,    # part of data instances to grow tree 
+              "colsample_bytree" = 0.85  # subsample ratio of columns when constructing each tree
+              )
+
+set.seed(9)
+system.time(xgb_model_cv<-xgb.cv(params=param,data=full_train_matrix,label=full_targets_train,nfold=5,nrounds = 400,prediction=TRUE,verbose=F))
+which.min(xgb_model_cv$dt[,test.mlogloss.mean])
+print(min(xgb_model_cv$dt[,test.mlogloss.mean]))
+
+preds <- vector("list", length = 2000)
+library(xgboost)
+for(i in 1066:2000){
+    print(paste('training model:', i))
+    model <- xgboost(data = full_train_matrix, label = full_targets_train, params = param, nround = which.min(xgb_model_cv$dt[,test.mlogloss.mean]),verbose = 0,num_class = 5)
+    
+    print(paste('applying prediction:', i))
+    preds[[i]] <- predict(model, newdata = test_matrix)
+}
+
+preds.100 = preds[1:100]
+preds.200 = preds[1:200]
+preds.400 = preds[1:400]
+preds.800 = preds[1:800]
+com_preds.100 <- colMeans(do.call(rbind, preds.100))
+com_preds.200 <- colMeans(do.call(rbind, preds.200))
+com_preds.400 <- colMeans(do.call(rbind, preds.400))
+com_preds.800 <- colMeans(do.call(rbind, preds.800))
+result.100 <- matrix(com_preds.100,nrow = 11456, ncol = 5, byrow = T)
+result.200 <- matrix(com_preds.200,nrow = 11456, ncol = 5, byrow = T)
+result.400 <- matrix(com_preds.400,nrow = 11456, ncol = 5, byrow = T)
+result.800 <- matrix(com_preds.800,nrow = 11456, ncol = 5, byrow = T)
+result.100 <- data.frame(c(1:11456), result.100)
+result.200 <- data.frame(c(1:11456), result.200)
+result.400 <- data.frame(c(1:11456), result.400)
+result.800 <- data.frame(c(1:11456), result.800)
+colnames(result.100) <- c("ID",outcome.level)
+colnames(result.200) <- c("ID",outcome.level)
+colnames(result.400) <- c("ID",outcome.level)
+colnames(result.800) <- c("ID",outcome.level)
+write.csv(result.100, file = "9.csv", row.names = F)
+write.csv(result.200, file = "10.csv", row.names = F)
+write.csv(result.400, file = "11.csv", row.names = F)
+write.csv(result.800, file = "12.csv", row.names = F)
+```
+
+###Stacking Random Forest
+```{r}
+train = read.csv("train.csv",header = T, stringsAsFactors = F)
+test = read.csv("test.csv",header = T, stringsAsFactors = F)
+train$AnimalID <- NULL
+train$OutcomeSubtype <- NULL
+test_ID <- test$ID
+test$ID <- NULL
+
+# Add some date/time-related variables
+library(lubridate)
+
+train$DateTime <- as.POSIXct(train$DateTime)
+test$DateTime <- as.POSIXct(test$DateTime)
+
+train$year <- year(train$DateTime)
+train$month <- month(train$DateTime)
+train$wday <- wday(train$DateTime)
+train$hour <- hour(train$DateTime)
+
+test$year <- year(test$DateTime)
+test$month <- month(test$DateTime)
+test$wday <- wday(test$DateTime)
+test$hour <- hour(test$DateTime)
+
+train$DateTime <- as.numeric(train$DateTime)
+test$DateTime <- as.numeric(test$DateTime)
+
+# Write a function to convert age outcome to numeric age in days
+convert <- function(age_outcome){
+  split <- strsplit(as.character(age_outcome), split=" ")
+  period <- split[[1]][2]
+  if (grepl("year", period)){
+    per_mod <- 365
+  } else if (grepl("month", period)){ 
+    per_mod <- 30
+  } else if (grepl("week", period)){
+    per_mod <- 7
+  } else
+    per_mod <- 1
+  age <- as.numeric(split[[1]][1]) * per_mod
+  return(age)
+}
+
+train$AgeuponOutcome <- sapply(train$AgeuponOutcome, FUN=convert)
+test$AgeuponOutcome <- sapply(test$AgeuponOutcome, FUN=convert)
+sort(table(train$AgeuponOutcome),decreasing = T)[1:3]
+sort(table(test$AgeuponOutcome),decreasing = T)[1:3]
+train[is.na(train)] <- 365  # Fill NA with 365, most common age
+test[is.na(test)] <- 365 # Fill NA with 365, most common age
+
+# Remove row with missing sex label and drop the level
+train <- train[-which(train$SexuponOutcome == ""),]
+train$SexuponOutcome <- droplevels(as.factor(train$SexuponOutcome))
+
+# Add var for name length
+train$name_len <- sapply(as.character(train$Name),nchar)
+test$name_len <- sapply(as.character(test$Name),nchar)
+
+train$Name <- NULL
+test$Name <- NULL
+
+# Create indicator vars for breeds and mix
+train_breeds <- as.character(train$Breed)
+test_breeds <- as.character(test$Breed)
+all_breeds <- unique(c(train_breeds,test_breeds))
+breed_words <- unique(unlist(strsplit(all_breeds, c("/| Mix")))) 
+
+for (breed in breed_words){
+  train[breed] <- as.numeric(grepl(breed, train_breeds))
+  test[breed] <- as.numeric(grepl(breed, test_breeds))
+}
+
+library(stringr)
+
+train["crosses"] <- str_count(train$Breed, pattern="/")
+test["crosses"] <- str_count(test$Breed, pattern="/")
+
+train$Breed <- NULL
+test$Breed <- NULL
+
+# Create indicator vars for color
+train_colors <- as.character(train$Color)
+test_colors <- as.character(test$Color)
+all_colors <- unique(c(train_colors,test_colors))
+color_words <- unique(unlist(strsplit(all_colors, c("/")))) 
+
+for (color in color_words){
+  train[color] <- as.numeric(grepl(color, train_colors))
+  test[color] <- as.numeric(grepl(color, test_colors))
+}
+
+train["color_count"] <- str_count(train$Color, pattern="/")+1
+test["color_count"] <- str_count(test$Color, pattern="/")+1
+
+train$Color <- NULL
+test$Color <- NULL
+
+train$OutcomeType = as.factor(train$OutcomeType)
+targets <- train$OutcomeType
+train$AnimalType = as.factor(train$AnimalType)
+train$SexuponOutcome = as.factor(train$SexuponOutcome)
+test$AnimalType=as.factor(test$AnimalType)
+test$SexuponOutcome =as.factor(test$SexuponOutcome)
+train$DateTime=NULL
+test$DateTime=NULL
+library(plyr)
+train = colwise(as.factor)(train)
+test = colwise(as.factor)(test)
+
+for(i in c(4,8,9)){
+    train[,i] = as.numeric(train[,i])
+    test[,i-1] = as.numeric(test[,i-1])
+}
+
+set.seed(123)
+library(randomForest)
+colnames(train) = gsub(" ","",colnames(train))
+colnames(test) = gsub(" ","",colnames(test))
+rf_models <- vector("list", length = 5)
+#rf_model_cv = rfcv(trainx = train[,-c(1)],trainy = train$OutcomeType)
+for(i in 1:5){
+    print(paste('training model:', i))
+    rf_models[[i]] <- randomForest(train$OutcomeType~., data = train)
+}
+
+rf_model <- do.call(combine, rf_models)
+
+predrf <- predict(rf_model, newdata = test, type = "prob")
+predrf <- data.frame(c(1:11456), predrf)
+colnames(predrf) <- c("ID",outcome.level)
+write.csv(predrf, file = "17.csv", row.names = F) 
+```
+
+
+###https://github.com/fhlgood/K_sa
+```{r}
+train = read.csv("train.csv",header = T, stringsAsFactors = F)
+test = read.csv("test.csv",header = T, stringsAsFactors = F)
+train <- data.table(train)
+test <- data.table(test)
+
+# a function to count number of words describing colors
+word_count <- function(x){
+    cleaned <- gsub("/", " ", x)
+    parsed  <- strsplit(cleaned, " ")
+    count <- length(unlist(parsed))
+return(count)    
+}
+
+# create a name frequency table
+train[, INI := substr(Name, 1, 1)]
+train[INI == "3", Name := "Buster"]
+train[INI == "'", Name := "Stache"]
+train[INI == " ", Name := c("Joanie", "Mario")]
+train[, INI := substr(Name, 1, 1)]
+
+names <- c(train$Name)
+name_freq <- table(names)/length(names)
+
+test[, INI := substr(Name, 1, 1)]
+test[INI == "3", Name := "Buster"]
+test[INI == "'", Name := "Stache"]
+test[INI == " ", Name := c("Joanie", "Mario")]
+test[, INI := substr(Name, 1, 1)]
+
+# create a color frequency table
+colors <- c(train$Color)
+colors <- gsub("/", " ", colors)
+split_col <- unlist(strsplit(colors, " "))
+col_freq <- table(split_col)/length(split_col)
+
+# a clean function for training and testing
+clean <- function(df){
+    dt <- data.table(df)
+    # create a new feature named 1:Yes, 0:No
+    cat("simplifying names...\n")
+    dt[INI == "", named := 0]
+    dt[INI != "", named := 1]
+    
+    # parse date
+    cat("parsing date...\n")
+    dt[, DateTime:= ymd_hms(DateTime)]
+    dt[, time := .(hour(DateTime) + minute(DateTime)/60)]
+    dt[, year := factor(lubridate::year(DateTime))]
+    dt[, month := factor(lubridate::month(DateTime))]
+    dt[, day := as.numeric(lubridate::day(DateTime))]
+    dt[, weekday := lubridate::wday(DateTime)]
+    
+    # parse sex and status
+    cat("parsing sex and status...\n")
+    dt[, sex := "Unknown"]
+    dt[SexuponOutcome %like% "Male", sex := "Male"]
+    dt[SexuponOutcome %like% "Female", sex := "Female"]
+    
+    dt[, status := "Unknown"]
+    dt[SexuponOutcome %like% "Neutered", status := "Sterilized"]
+    dt[SexuponOutcome %like% "Spayed", status := "Sterilized"]
+    dt[SexuponOutcome %like% "Intact", status := "Intact"]
+    
+    # form age in days
+    cat("transform age into days...\n")
+    dt[AgeuponOutcome == "", AgeuponOutcome := "unknown unknown"]
+    parsed_age <- do.call(rbind, sapply(dt[, AgeuponOutcome], strsplit, " "))
+    dt[, c("num", "unit") := .(parsed_age[, 1], parsed_age[, 2])]
+    dt[unit %like% "year", age := as.numeric(num)*365]
+    dt[unit %like% "month", age := as.numeric(num)*30.5]
+    dt[unit %like% "week", age := as.numeric(num)*7]
+    dt[unit %like% "day", age := as.numeric(num)]
+    dt[unit == "unknown", age := NA]
+    
+    # paring breed
+    cat("dividing breed groups...\n")
+    dt[Breed %like% "Mix", Breed := "Mix"]
+    dt[!Breed %like% "Mix", Breed := "Pure"]
+    
+    # simplify color
+    cat("simplifying colors into numbers...\n")
+    color_count <- vector("numeric", length = nrow(dt))
+    for(i in seq_along(dt[, Color])){
+        color_count[i] <- word_count(dt[i, Color])
+    }
+    dt[, color := .(color_count)]
+    
+    # further categorizing color.....
+    cat("calculating color frequencies...\n")
+    color_f <- vector("numeric", length = nrow(dt))
+    dt[, Color := gsub("/", " ", Color)]
+    for(i in 1:nrow(dt)){
+        color_p <- unlist(strsplit(dt[i, Color], " "))
+        color_f[i] <- sum(col_freq[color_p])
+    }
+    dt[, color_freq := .(color_f)]
+
+    # drop orginal features
+    cat("dropping orginal features...\n")
+    if("OutcomeType" %in% colnames(df)){
+        print("training set")
+        dt <- dt[, .(OutcomeType, AnimalType, named, Breed, #to keep
+                     year, month, day, weekday, age, color_f,
+                     time, status)]
+        to_factors <- c("OutcomeType", "AnimalType","named", "Breed",
+                        "status")
+    } else {
+        print("testing set")
+        dt <- dt[, .(AnimalType, named, Breed, year, # to keep
+                     month, day, weekday, age, color_f, time,
+                     status)]
+        to_factors <- c("AnimalType", "named", "Breed",
+                        "status")
+    }
+    
+    # convert to factor
+    for(col in to_factors){
+        print(paste("converting to factors...", col))
+        set(dt, j = col, value = as.factor(dt[[col]]))
+    }
+    
+    for_imp <- which(is.na(dt), arr.ind = T)
+    cat("these missing values need to be imputed: \n")
+    print(for_imp)
+return(dt)
+}
+
+dt.train <- clean(train)
+dt.test <- clean(test)
+
+
+library(data.table)
+library(Matrix)
+library(xgboost)
+library(ggplot2)
+library(randomForest)
+
+# imputation of age
+full_imp <- rbindlist(list(dt.train[, -1, with = F], dt.test))
+
+# impute missing values with linear regresion
+imput_age <- lm(age~., data = full_imp)
+summary(imput_age)
+imp_age <- predict(imput_age, full_imp[which(is.na(age), arr.ind = T), ])
+full_imp[is.na(full_imp[, age]), age := .(imp_age)]
+
+#------------------------------------full training -------------------#
+# create matrices
+to_train <- full_imp[1:nrow(dt.train), ]
+to_test <- full_imp[-c(1:nrow(dt.train)), ]
+X <- sparse.model.matrix(OutcomeType~.-1, 
+                         data = to_train[, OutcomeType := dt.train[, OutcomeType]])
+
+Y <- as.numeric(dt.train[, OutcomeType]) - 1
+numclass <- range(Y)[2] + 1
+
+# set the parameter 
+params <- list("objective" = "multi:softprob",
+               "eta" = .1,
+               "max_depth" = 8,
+               "eval_metric" = "mlogloss",
+               "num_class" = numclass,
+               "subsample" = .8)
+
+# cross-validation
+nround =200
+set.seed(123)
+bst.cv <-  xgb.cv(params = params, data = X, label = Y, nfold = 10, 
+                  nround = nround, verbose = T)
+
+# cv error plot
+cv_error <- bst.cv$test.mlogloss.mean
+tr_error <- bst.cv$train.mlogloss.mean
+min <- which.min(cv_error)
+print(paste(min, cv_error[min]))
+
+# plot
+ggplot(bst.cv, aes(x = c(1: dim(bst.cv)[1])))+
+    geom_line(aes(y = train.mlogloss.mean), color = "green")+
+    geom_line(aes(y = test.mlogloss.mean), color = "blue")+
+    geom_vline(aes(xintercept = min), color = "red")+
+    xlab("number of iterations")+
+    ylab("mlogloss")
+
+# feature importance
+imp <- xgb.importance(dimnames(X)[[2]], model = bst)
+p_imp <- xgb.plot.importance(imp[1:10])
+p_imp
+
+# train model
+# apply predictions
+mtest <- sparse.model.matrix(~.-1, data = to_test)
+
+preds <- vector("list", length = 100)
+for(i in 1:100){
+    print(paste('training model:', i))
+    model <- xgboost(data = X, label = Y, params = params, nround = min)
+    
+    print(paste('applying prediction:', i))
+    preds[[i]] <- predict(model, newdata = mtest)
+}
+
+com_preds <- colMeans(do.call(rbind, preds))
+result <- matrix(com_preds,nrow = 11456, ncol = numclass, byrow = T)
+result <- data.frame(c(1:11456), result)
+colnames(result) <- c("ID",outcome.level)
+write.csv(result, file = "14.csv", row.names = F)
+
+#------random forest-------------#
+set.seed(123)
+rf_models <- vector("list", length = 5)
+for(i in 1:5){
+    print(paste('training model:', i))
+    rf_models[[i]] <- randomForest(OutcomeType~., data = to_train, 
+                       mtry = 4, ntree = 1000, do.trace = T)
+}
+
+
+rf_model <- do.call(combine, rf_models)
+
+predrf <- predict(rf_model, newdata = to_test, type = "prob")
+predrf <- data.frame(c(1:11456), predrf)
+colnames(predrf) <- c("ID",outcome.level)
+write.csv(predrf, file = "15.csv", row.names = F) 
+```
